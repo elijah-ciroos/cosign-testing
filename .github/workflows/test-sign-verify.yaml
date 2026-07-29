@@ -85,14 +85,14 @@ jobs:
           for tag in ${TAGS}; do
             cosign attest --yes \
               --predicate sbom.spdx.json \
-              --type spdx \
+              --type spdxjson \
               "${tag}@${DIGEST}"
           done
 
       - name: Verify the SBOM attestation
         run: |
           cosign verify-attestation ${{ env.images }} \
-            --type spdx \
+            --type spdxjson \
             --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
 
