@@ -14,6 +14,10 @@ jobs:
       packages: write
       id-token: write # required for keyless signing via GitHub OIDC
 
+    outputs:
+      image: ghcr.io/elijah-ciroos/cosign-testing
+      digest: ${{ steps.build-and-push.outputs.digest }}
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,4 +67,68 @@ jobs:
         run: |
           cosign verify ${{ env.images }} \
             --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.18.0
+
+      - name: Generate SBOM with Syft
+        run: |
+          image=$(echo "${{ env.images }}" | awk '{print $1}')
+          syft "${image}" -o spdx-json="sbom.spdx.json"
+
+      - name: Attest the SBOM with GitHub OIDC
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.docker_meta.outputs.tags }}
+        run: |
+          for tag in ${TAGS}; do
+            cosign attest --yes \
+              --predicate sbom.spdx.json \
+              --type spdx \
+              "${tag}@${DIGEST}"
+          done
+
+      - name: Verify the SBOM attestation
+        run: |
+          cosign verify-attestation ${{ env.images }} \
+            --type spdx \
+            --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+  # Generates SLSA3 build provenance for the image using the official SLSA
+  # generator. This runs as a separate reusable workflow (rather than a step
+  # in build-sign-verify) because that trust-boundary separation is what lets
+  # the provenance attest to how the image was actually built.
+  provenance:
+    needs: build-sign-verify
+    permissions:
+      actions: read # required to read the workflow run that produced the image
+      id-token: write # required for keyless signing via GitHub OIDC
+      packages: write # required to upload the attestation to ghcr.io
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build-sign-verify.outputs.image }}
+      digest: ${{ needs.build-sign-verify.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  verify-provenance:
+    needs: [build-sign-verify, provenance]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Verify the SLSA provenance attestation
+        run: |
+          cosign verify-attestation \
+            "${{ needs.build-sign-verify.outputs.image }}@${{ needs.build-sign-verify.outputs.digest }}" \
+            --type slsaprovenance \
+            --certificate-identity="https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v2.1.0" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
