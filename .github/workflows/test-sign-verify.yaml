@@ -1,0 +1,66 @@
+name: test-sign-verify
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-sign-verify:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for keyless signing via GitHub OIDC
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.11.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: docker_meta
+        uses: docker/metadata-action@v5.8.0
+        with:
+          images: ghcr.io/elijah-ciroos/cosign-testing
+          tags: type=sha,format=long
+
+      - name: Build and push test image
+        uses: docker/build-push-action@v6.18.0
+        id: build-and-push
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+
+      - name: Sign the image with GitHub OIDC
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.docker_meta.outputs.tags }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+          echo "images=${images}" >> "$GITHUB_ENV"
+
+      - name: Verify the signature
+        run: |
+          cosign verify ${{ env.images }} \
+            --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
