@@ -18,10 +18,10 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
-
+      #COPY FROM HERE
       - name: Install Cosign
         uses: sigstore/cosign-installer@v4.0.0
-
+      #COPY TO HERE
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.11.1
 
