@@ -46,6 +46,7 @@ jobs:
           push: true
           tags: ${{ steps.docker_meta.outputs.tags }}
 
+      #COPY FROM HERE
       - name: Sign the image with a cosign key pair
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
@@ -63,3 +64,4 @@ jobs:
       - name: Verify the signature
         run: |
           cosign verify --key cosign.pub ${{ env.images }}
+      #COPY TO HERE
