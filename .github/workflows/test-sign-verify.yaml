@@ -12,7 +12,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write # required for keyless signing via GitHub OIDC
 
     outputs:
       image: ghcr.io/elijah-ciroos/cosign-testing
@@ -51,23 +50,23 @@ jobs:
           push: true
           tags: ${{ steps.docker_meta.outputs.tags }}
 
-      - name: Sign the image with GitHub OIDC
+      - name: Sign the image with a cosign key pair
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
           TAGS: ${{ steps.docker_meta.outputs.tags }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           images=""
           for tag in ${TAGS}; do
             images+="${tag}@${DIGEST} "
           done
-          cosign sign --yes ${images}
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY ${images}
           echo "images=${images}" >> "$GITHUB_ENV"
 
       - name: Verify the signature
         run: |
-          cosign verify ${{ env.images }} \
-            --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
-            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+          cosign verify --key cosign.pub ${{ env.images }}
 
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0.18.0
@@ -77,13 +76,16 @@ jobs:
           image=$(echo "${{ env.images }}" | awk '{print $1}')
           syft "${image}" -o spdx-json="sbom.spdx.json"
 
-      - name: Attest the SBOM with GitHub OIDC
+      - name: Attest the SBOM with a cosign key pair
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
           TAGS: ${{ steps.docker_meta.outputs.tags }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           for tag in ${TAGS}; do
             cosign attest --yes \
+              --key env://COSIGN_PRIVATE_KEY \
               --predicate sbom.spdx.json \
               --type spdxjson \
               "${tag}@${DIGEST}"
@@ -91,10 +93,9 @@ jobs:
 
       - name: Verify the SBOM attestation
         run: |
-          cosign verify-attestation ${{ env.images }} \
+          cosign verify-attestation --key cosign.pub \
             --type spdxjson \
-            --certificate-identity="https://github.com/elijah-ciroos/cosign-testing/.github/workflows/test-sign-verify.yaml@refs/heads/main" \
-            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+            ${{ env.images }}
 
   # Generates SLSA3 build provenance for the image using the official SLSA
   # generator. This runs as a separate reusable workflow (rather than a step
