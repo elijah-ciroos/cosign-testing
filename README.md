@@ -24,7 +24,8 @@ cat > ~/zot-registry/config.json <<'EOF'
   "extensions": {
     "search": { "enable": true },
     "ui": { "enable": true },
-    "mgmt": { "enable": true }
+    "mgmt": { "enable": true },
+    "trust": { "enable": true, "cosign": true }
   }
 }
 EOF
@@ -36,12 +37,27 @@ docker run -d -p 5000:5000 \
   ghcr.io/project-zot/zot-linux-amd64:latest
 ```
 
+The `trust` extension is what would let zot itself verify and report on
+cosign signatures (in addition to us shelling out to `cosign verify`).
+**As of zot v2.1.20 this still doesn't work for cosign v3's default output.**
+zot v2.1.17 stopped crashing when indexing the new Sigstore bundle format,
+and v2.1.19 fixed a real digest-binding bug in trust verification — but
+neither taught the `trust`/`imagetrust` extension to recognize the new
+bundle format in the first place. It's still only wired up for the old
+annotation-based "simple signing" layout. Confirmed by hand against
+`ghcr.io/project-zot/zot-linux-amd64:latest` (v2.1.20) on 2026-08-05:
+`cosign verify` succeeds, but the GraphQL `IsTrusted` field stays `false`
+and `Author` stays empty even after uploading the matching public key.
+Tracked upstream as
+[project-zot/zot#4299](https://github.com/project-zot/zot/issues/4299)
+(a maintainer suggested v2.1.19 as a fix; it isn't — see step 7 below for
+how to re-check once it's actually resolved).
+
 Docker treats `localhost`/`127.0.0.0/8` registries as insecure by default, so
 pushes over plain HTTP to `localhost:5000` work with no extra daemon config.
 
 Open **http://localhost:5000/** in a browser for the zot web UI — it lists
-repositories and tags. (Its signature-trust display doesn't understand
-cosign v3's default signature format — not something we rely on here.)
+repositories and tags.
 
 ### 2. Build and push the test image
 
@@ -100,6 +116,30 @@ publicly-distributed artifact):
 ```bash
 cosign verify --insecure-ignore-tlog=true --key cosign.pub "$IMAGE"
 ```
+
+### 7. Check whether zot's `trust` extension agrees (currently: no)
+
+Upload the public key — before or after signing, order doesn't matter, zot
+re-evaluates on each query — so zot's `trust` extension can independently
+verify the signature:
+
+```bash
+curl --data-binary @cosign.pub "http://localhost:5000/v2/_zot/ext/cosign"
+```
+
+Then query the GraphQL search endpoint for the image's signature status:
+
+```bash
+curl -s "http://localhost:5000/v2/_zot/ext/search" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ Image(image: \"cosign-testing:local\") { Digest IsSigned SignatureInfo { Tool IsTrusted Author } } }"}' \
+  | jq .
+```
+
+Today this comes back `IsSigned: true` but `SignatureInfo[].IsTrusted: false`
+and `Author: ""`, regardless of whether the right key was uploaded — see the
+note in step 1. `cosign verify` in step 6 is the real check for now; treat
+this step as a regression probe to rerun after a future zot upgrade.
 
 ### Cleanup
 
