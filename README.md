@@ -147,3 +147,102 @@ this step as a regression probe to rerun after a future zot upgrade.
 docker rm -f zot
 rm -rf ~/zot-registry
 ```
+
+## Testing Kyverno image-verification policies against zot
+
+Investigated whether [Kyverno](https://kyverno.io/) can block/flag pods
+running images that aren't signed, reusing the zot setup above as the
+in-cluster registry for a local [kind](https://kind.sigs.k8s.io/) cluster.
+Two separate policy mechanisms exist in Kyverno; neither fully worked, for
+two independent reasons. Confirmed 2026-08-05 against Kyverno chart 3.8.2
+(app v1.18.2) and cosign v3.1.2.
+
+**Registry reachability from kind needs the zot container joined to the
+`kind` Docker network**, in addition to the host port mapping — kubelet's
+image pull and Kyverno's own registry client both run as processes inside
+the cluster's own network namespace, where `localhost` means the pod itself,
+not the host:
+
+```bash
+docker network connect kind zot
+```
+
+Reference the image in-cluster as `zot:5000/...` (zot's real listen port),
+not the host-mapped `localhost:5000/...` used for `docker push`/`cosign sign`.
+This doesn't survive `docker rm -f zot` — reconnect after recreating it.
+
+**Plain-HTTP zot needs explicit opt-in, twice, at two different layers:**
+
+- containerd on the kind node defaults to HTTPS for any registry hostname
+  that isn't literally `localhost`/`127.0.0.0/8`/`*.local`, and will fail
+  pulling the pod's own image with `http: server gave HTTP response to
+  HTTPS client` unless told otherwise via a per-registry mirror config:
+  ```bash
+  docker exec kyverno-test-control-plane mkdir -p /etc/containerd/certs.d/zot:5000
+  docker exec -i kyverno-test-control-plane tee /etc/containerd/certs.d/zot:5000/hosts.toml <<'EOF'
+  server = "http://zot:5000"
+  [host."http://zot:5000"]
+    capabilities = ["pull", "resolve"]
+  EOF
+  docker exec -i kyverno-test-control-plane tee -a /etc/containerd/config.toml <<'EOF'
+
+  [plugins."io.containerd.grpc.v1.cri".registry]
+    config_path = "/etc/containerd/certs.d"
+  EOF
+  docker exec kyverno-test-control-plane systemctl restart containerd
+  ```
+- Kyverno's own (legacy) registry client needs the same opt-in separately,
+  via a Helm value: `--set features.registryClient.allowInsecure=true`.
+
+**Finding: the legacy `ClusterPolicy.verifyImages` mechanism can never pass,
+because cosign v3 no longer writes the signature format it looks for.**
+`ClusterPolicy`'s `verifyImages`/`keys` attestor (the long-standing Kyverno
+mechanism) only knows how to find signatures via the old
+`sha256-<digest>.sig` tag convention. cosign v3.1.2 writes exclusively via
+the OCI 1.1 Referrers API instead — confirmed by querying
+`/v2/<repo>/referrers/<digest>` directly and finding real sigstore bundle
+entries there, with zero matching `.sig` tags anywhere in the same
+repository. Tried both `--registry-referrers-mode=legacy` and
+`COSIGN_DOCKER_MEDIA_TYPES=1` on `cosign sign` to force the legacy write path;
+neither changed where the signature landed. Every `cosign verify` against
+this same image succeeds fine (it's Referrers-aware) — this is specifically
+a `ClusterPolicy.verifyImages` limitation. This is the same category of gap
+as the zot trust-extension issue above: tooling built against cosign's old
+tag convention hasn't caught up to cosign v3's new default. No upstream
+Kyverno issue filed yet for this one.
+
+**Newer `ImageValidatingPolicy` (CEL-based) is unconfirmed, not disproven.**
+Kyverno also ships a second, newer policy CRD
+(`imagevalidatingpolicies.policies.kyverno.io`) with a much richer,
+cosign-verify-flag-shaped attestor schema (`cosign.key`, `cosign.keyless`,
+`cosign.tuf`) that looks far more likely to understand Referrers-based
+signatures — but its `verifyImageSignatures()` CEL function appears to use
+its own registry client, separate from the one `allowInsecure` fixes:
+```
+policy verify-cosign-signature/evaluation error: failed to evaluate policy:
+Get "https://zot:5000/v2/": http: server gave HTTP response to HTTPS client
+```
+Real production registries are HTTPS, so this may simply never matter in
+practice — but it meant we couldn't get a real answer locally. Routing
+around it via GHCR (real HTTPS, no local-registry transport issues) hit a
+different open question instead: none of the CI-pushed images in
+`ghcr.io/elijah-ciroos/cosign-testing` have *any* signature artifact visible,
+via either convention — querying GHCR's Referrers API for the latest tag's
+digest returns `MANIFEST_UNKNOWN`. Unknown whether that's a GHCR limitation,
+an artifact of how the CI signing step runs, or something else. Not
+investigated further.
+
+**Net result:** proved Kyverno *can* mechanically intercept and evaluate
+pods against a local registry (transport-layer problems are all solved and
+documented above), but couldn't get a real pass/fail signal on either policy
+mechanism against a cosign-v3-signed image in this local setup. Whether
+Kyverno can enforce cosign v3 signatures at all remains an open question —
+next step would be a registry with working HTTPS *and* confirmed OCI 1.1
+Referrers support (self-signed zot, or debugging the GHCR gap above).
+
+### Cleanup
+
+```bash
+kind delete cluster --name kyverno-test
+docker network disconnect kind zot
+```
